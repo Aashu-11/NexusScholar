@@ -1,0 +1,19 @@
+fastapi==0.115.8
+uvicorn[standard]==0.34.0
+aiosqlite==0.21.0
+python-multipart==0.0.20
+httpx==0.28.1
+python-dotenv==1.0.1
+numpy==2.2.3
+rank-bm25==0.2.2
+PyMuPDF==1.25.3
+networkx==3.4.2
+scikit-learn==1.6.1
+sentence-transformers==3.4.1
+# PyTorch with CUDA support — GPU-accelerated embeddings and reranking.
+# Install via: pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
+# For CUDA 11.8 use: --extra-index-url https://download.pytorch.org/whl/cu118
+# For CPU-only (no GPU): pip install torch (without the extra index)
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch>=2.2.0
+faiss-cpu>=1.7.4
