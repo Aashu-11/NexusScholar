@@ -36,6 +36,13 @@ from backend.retrieval.compressor import compress_chunks
 from backend.retrieval.chunk_expander import expand_with_parents, fetch_sibling_passages
 from backend.retrieval.pseudo_relevance_feedback import extract_expansion_terms, build_expanded_query
 from backend.generation.markdown_fixer import ensure_table_in_synthesis
+from backend.generation.synthesizer import _execute_math_blocks
+try:
+    from backend.generation.math_sandbox import MathSandbox as _MathSandbox
+    _math_sandbox_available = True
+except Exception:  # pragma: no cover
+    _MathSandbox = None  # type: ignore[assignment,misc]
+    _math_sandbox_available = False
 from backend.generation.evidence_dedup import deduplicate_evidence
 from backend.generation.self_evaluator import evaluate_answer
 from backend.ingestion.service import ingest_pdf_file, ingest_text_document, rebuild_indexes
@@ -447,6 +454,26 @@ async def chat_endpoint(request: ChatRequest):
             full_text = ensure_table_in_synthesis(full_text)
             logger.info("Markdown table formatting applied")
 
+            # ── Post-synthesis: Execute math/python code blocks in sandbox ──
+            if _math_sandbox_available and _MathSandbox is not None:
+                try:
+                    _sandbox = _MathSandbox()
+                    text_before = full_text
+                    full_text = await _execute_math_blocks(
+                        full_text, evidence_table, _sandbox,
+                        query=request.query, groq=groq,
+                    )
+                    # If the sandbox changed the text (code blocks were executed),
+                    # send the updated content to the client immediately so the
+                    # rendered view shows verified results before answer_complete.
+                    if full_text != text_before:
+                        yield _sse("math_results", {"updated_text": full_text})
+                        logger.info("Math sandbox: arithmetic blocks processed and sent to client")
+                    else:
+                        logger.info("Math sandbox: no code blocks found or no changes made")
+                except Exception as _sb_exc:
+                    logger.warning("Math sandbox execution skipped: %s", _sb_exc)
+
             # ── Self-evaluation + conditional regeneration ──────────
             MAX_REGENERATION_ATTEMPTS = 2
             regen_attempt = 0
@@ -512,6 +539,19 @@ async def chat_endpoint(request: ChatRequest):
                     yield _sse("synthesis_token", {"token": token, "is_regeneration": True})
 
                 full_text = ensure_table_in_synthesis(new_full_text)
+                # ── Post-regen: Execute math blocks in sandbox ──
+                if _math_sandbox_available and _MathSandbox is not None:
+                    try:
+                        _sandbox = _MathSandbox()
+                        text_before_regen = full_text
+                        full_text = await _execute_math_blocks(
+                            full_text, evidence_table, _sandbox,
+                            query=request.query, groq=groq,
+                        )
+                        if full_text != text_before_regen:
+                            yield _sse("math_results", {"updated_text": full_text})
+                    except Exception as _sb_exc:
+                        logger.warning("Math sandbox (regen) skipped: %s", _sb_exc)
 
             # ── Post-synthesis: Entity verification ──────
             if settings.ENTITY_VERIFY_POST_SYNTHESIS and entity_profile and entity_profile.requires_entity_grounding:

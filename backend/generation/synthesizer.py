@@ -7,6 +7,7 @@ Enforces 6 hard citation rules. No parametric generation for claims.
 from __future__ import annotations
 import json
 import logging
+import re
 from typing import AsyncGenerator, Optional
 
 from backend.config import settings
@@ -15,6 +16,40 @@ from backend.generation.planner import TaskPlan
 from backend.generation.evidence_builder import EvidenceTable
 from backend.retrieval.entity_extractor import QueryEntityProfile
 from backend.generation.question_decomposer import QuestionDecomposition
+
+try:
+    from backend.generation.math_sandbox import (
+        MathSandbox,
+        extract_evidence_variables,
+        format_variables_for_prompt,
+    )
+    _SANDBOX_AVAILABLE = True
+except Exception as _sandbox_import_err:  # pragma: no cover
+    _SANDBOX_AVAILABLE = False
+
+    def extract_evidence_variables(evidence_rows: list) -> dict:  # type: ignore[misc]
+        return {}
+
+    def format_variables_for_prompt(variables: dict) -> str:  # type: ignore[misc]
+        return ""
+
+    logging.getLogger(__name__).warning(
+        "Math sandbox unavailable — arithmetic blocks will not be executed: %s",
+        _sandbox_import_err,
+    )
+
+try:
+    from backend.generation.math_web_verifier import (
+        web_verify_math,
+        format_verified_block,
+        WebVerificationResult,
+    )
+    _WEB_VERIFY_AVAILABLE = True
+except Exception as _web_verify_import_err:  # pragma: no cover
+    _WEB_VERIFY_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "Math web verifier unavailable: %s", _web_verify_import_err
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -92,17 +127,47 @@ Example of a CORRECT table:
 | BERT-base | GLUE | 79.60% | 0.803 | 2018 |
 | RoBERTa | GLUE | 88.50% | 0.891 | 2019 |
 
-## CHAIN-OF-ARITHMETIC — MANDATORY FOR ANY NUMERICAL QUERY
-When the query requires a calculated value (density, ratio, average, total, percentage, etc.) that is NOT
-already written in the evidence as a final answer, you MUST show explicit step-by-step arithmetic:
+## ADVERSARIAL CHAIN-OF-ARITHMETIC — MANDATORY CHECKLIST
+Before performing any calculation, you MUST generate a 'Pre-Calculation Audit' block:
 
-  **Step 1 — Extract:** identify the raw integers / quantities from the evidence row.
-  **Step 2 — Formula:** state the formula, e.g. $\text{density} = \frac{\text{entities}}{\text{documents}}$
-  **Step 3 — Substitute:** plug in the extracted numbers.
-  **Step 4 — Compute:** show the arithmetic and state the result.
+1. **Dimensional Audit:** List every variable required for the query (e.g., Energy Intensity, Operational Hours, Grid Carbon Intensity).
+2. **Variable Grounding:** For each variable, cite the EXACT evidence row where it was found.
+3. **The "Abstention" Trigger:** If any primary variable is missing from the evidence, you are FORBIDDEN from estimating it. State: "Calculation aborted: Variable [X] is not present in the indexed corpus."
+4. **First-Principles Validation:** Before outputting a final result, ask: "Is this result physically possible?" 
+   - (e.g., Is efficiency > 100%? Is the value higher than the Landauer Limit?)
+   - If the answer is "No," delete the calculation and report a "Thermodynamic Inconsistency" in the evidence.
 
-Do NOT search for a pre-written conclusion in the text if one is not present — derive it yourself.
-Any arithmetic errors are a SYSTEM FAILURE equivalent to a citation violation.
+**Formula Execution (LaTeX only):**
+- Step 1 — Assumptions: List constants used (e.g., $k$, $T$, $\rho$) and their sources.
+- Step 2 — Derivation: Show the symbolic formula.
+- Step 3 — Unit Check: Show the dimensional cancellation (e.g., $[g/kWh] * [kWh/yr] = [g/yr]$).
+- Step 4 — Computation: Final numerical result.
+
+*CRITICAL: If the evidence provides a final number, use it. If the evidence provides raw data, derive it. NEVER 'estimate' a constant to make the math look complete.*
+
+RULE 10 — PYTHON SANDBOX MANDATE:
+When you need to compute a numerical result:
+
+1. Write a fenced Python code block (```python) containing ONLY the computation.
+2. Assign the final answer to a variable named `result`.
+3. Print it: `print(f"Result: {result}")`
+4. Use ONLY variable names that appear verbatim in the evidence (e.g., if evidence says
+   "18432 entities", use `entities = 18432`).
+5. Do NOT hardcode intermediate guesses — derive everything from evidence variables.
+6. The sandbox will execute your code and replace the block with the actual output.
+7. If you cannot find the required numbers in the evidence, write:
+   "I lack the variables to calculate this."
+8. For unit verification, include unit labels in your print statement so readers can
+   validate dimensional consistency.
+
+Example of a CORRECT computation block:
+```python
+# From evidence: "512 documents, 18432 total entities"
+documents = 512
+total_entities = 18432
+result = total_entities / documents
+print(f"Entity density = {total_entities} / {documents} = {result:.2f} entities/document")
+```
 
 ## MATHEMATICAL NOTATION — LaTeX
 - Render ALL mathematical expressions using LaTeX syntax so the UI can display them properly.
@@ -260,6 +325,31 @@ async def synthesize(
     max_output_tokens = 4096
     all_rows = evidence_table.to_llm_context()
 
+    # ── Pre-extract evidence variables and inject into system prompt ──────────
+    # This tells the LLM exactly which numeric variable names and values are
+    # available from evidence BEFORE it writes any Python code blocks.
+    # The sandbox will later OVERRIDE any LLM-hardcoded values with these.
+    evidence_vars: dict = {}
+    evidence_vars_section = ""
+    if _SANDBOX_AVAILABLE:
+        try:
+            evidence_vars = extract_evidence_variables(evidence_table.rows)
+            if evidence_vars:
+                evidence_vars_section = "\n\n" + format_variables_for_prompt(evidence_vars)
+                logger.info(
+                    "Synthesis: injecting %d evidence variable(s) into prompt: %s",
+                    len(evidence_vars),
+                    list(evidence_vars.keys())[:20],
+                )
+                print(
+                    f"\n[MATH] Pre-synthesis evidence variables ({len(evidence_vars)} found): "
+                    + ", ".join(f"{k}={v}" for k, v in list(evidence_vars.items())[:10])
+                    + ("..." if len(evidence_vars) > 10 else ""),
+                    flush=True,
+                )
+        except Exception as _ev_err:
+            logger.warning("Failed to extract evidence variables: %s", _ev_err)
+
     # Build structural sections (compound question + entity grounding)
     compound_section = ""
     if decomposition and decomposition.is_compound and len(decomposition.sub_questions) >= 2:
@@ -289,7 +379,7 @@ async def synthesize(
     # Trims ONLY the evidence JSON to keep total (input + max_output) within
     # the TPM limit.  System prompt, instructions, and max_output are untouched.
     user_prompt = _build_user_prompt(all_rows)
-    full_input = SYSTEM_PROMPT + user_prompt
+    full_input = SYSTEM_PROMPT + evidence_vars_section + user_prompt
     estimated_total = _estimate_tokens(full_input) + max_output_tokens
 
     if estimated_total > _GROQ_TPM_LIMIT:
@@ -301,7 +391,7 @@ async def synthesize(
         new_evidence_char_budget = max(4000, evidence_chars_current - chars_to_cut)
         trimmed_rows = _trim_evidence_rows(all_rows, new_evidence_char_budget)
         user_prompt = _build_user_prompt(trimmed_rows)
-        full_input = SYSTEM_PROMPT + user_prompt
+        full_input = SYSTEM_PROMPT + evidence_vars_section + user_prompt
         estimated_total = _estimate_tokens(full_input) + max_output_tokens
         logger.info(
             "Evidence fitting: %d→%d rows, estimated total %d tokens (limit=%d)",
@@ -313,8 +403,14 @@ async def synthesize(
             len(all_rows), estimated_total, _GROQ_TPM_LIMIT,
         )
 
+    # Append evidence variables to system prompt so the LLM knows which
+    # variable names to use in Python code blocks (sandbox will enforce these).
+    effective_system_prompt = SYSTEM_PROMPT
+    if evidence_vars_section:
+        effective_system_prompt = SYSTEM_PROMPT + evidence_vars_section
+
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": effective_system_prompt},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -352,3 +448,218 @@ I was unable to find sufficient evidence in the indexed literature to answer thi
 
 *NexusScholar abstains rather than generating an unsupported answer.*
 """
+
+
+# ── Math sandbox post-processing ─────────────────────────────────────────────
+
+_FENCED_RE = re.compile(
+    r'(```(python|math)\s*\n(.*?)```)',
+    re.DOTALL | re.IGNORECASE,
+)
+_COMPUTE_TAG_RE = re.compile(r'(<<COMPUTE:\s*(.*?)>>)', re.DOTALL)
+_ERROR_BLOCK = "> ⚠ Calculation not executed: I lack the variables to calculate this."
+_IRRELEVANT_BLOCK = "> ⚠ Calculation removed: result is not relevant to the query."
+
+_MATH_VALIDATION_SYSTEM = """You are a mathematical relevance auditor for a scientific research assistant.
+Your sole job: decide whether a computed Python result actually answers the user's question.
+
+Respond with EXACTLY one JSON object — nothing else:
+{"relevant": true/false, "reason": "<one sentence>"}
+
+Guidelines:
+- relevant=true  → the computation directly produces a number/value the question asked for
+- relevant=false → the computation is off-topic, produces a nonsensical unit, calculates
+                   something the question never asked about, or the result cannot possibly
+                   answer the question (e.g. user asked about accuracy but code computes word count)
+- Be strict: if there is any real doubt, return false."""
+
+
+async def _validate_math_relevance(
+    query: str,
+    code: str,
+    result_stdout: str,
+    groq: GroqClient,
+) -> tuple[bool, str]:
+    """
+    Ask the fast LLM whether *result_stdout* produced by *code* is a meaningful
+    answer to *query*.
+
+    Returns (is_relevant: bool, reason: str).
+    Falls back to (True, "validation skipped") on any error so a groq outage
+    never silently drops valid results.
+    """
+    import json as _json
+
+    prompt = (
+        f"USER QUERY: {query}\n\n"
+        f"PYTHON CODE EXECUTED:\n```python\n{code[:800]}\n```\n\n"
+        f"SANDBOX OUTPUT:\n{result_stdout[:400]}\n\n"
+        "Is this output a meaningful, on-topic answer to the user query above?\n"
+        "Reply with ONLY valid JSON: {\"relevant\": true/false, \"reason\": \"...\"}"
+    )
+    try:
+        raw = await groq.complete_fast(
+            messages=[
+                {"role": "system", "content": _MATH_VALIDATION_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+        )
+        # Strip markdown fences if the model wraps it
+        cleaned = re.sub(r"```(?:json)?\s*([\s\S]*?)```", r"\1", raw).strip()
+        data = _json.loads(cleaned)
+        relevant: bool = bool(data.get("relevant", True))
+        reason: str = str(data.get("reason", ""))
+        logger.info(
+            "Math relevance check: relevant=%s reason=%r", relevant, reason[:100]
+        )
+        return relevant, reason
+    except Exception as exc:
+        logger.warning("Math relevance validation failed (%s) — assuming relevant", exc)
+        return True, "validation skipped"
+
+
+async def _execute_math_blocks(
+    text: str,
+    evidence_table: EvidenceTable,
+    sandbox: "MathSandbox",
+    query: str = "",
+    groq: Optional[GroqClient] = None,
+) -> str:
+    """
+    Post-synthesis pass: find all ```python / ```math / <<COMPUTE:>> blocks in
+    *text*, execute each in the sandbox, LLM-validate relevance, then replace
+    the block with the verified output or an appropriate error marker.
+
+    Pipeline per block:
+      1. Extract evidence variables (for override injection).
+      2. Sandbox execution — evidence values OVERRIDE any LLM-hardcoded values.
+      3. LLM relevance check — is the result actually answering the query?
+      4. Replace block with result, irrelevance notice, or missing-variables notice.
+
+    Both sandbox and LLM steps are independently skippable on error so a
+    downstream failure never corrupts the answer.
+    """
+    if not _SANDBOX_AVAILABLE:
+        return text
+
+    # Extract numeric variables from evidence — used to OVERRIDE LLM-hardcoded values
+    evidence_vars = extract_evidence_variables(evidence_table.rows)
+    total_blocks = len(_FENCED_RE.findall(text)) + len(_COMPUTE_TAG_RE.findall(text))
+
+    print(
+        f"\n[MATH] Post-synthesis: found {total_blocks} code block(s). "
+        f"Evidence vars available: {len(evidence_vars)} "
+        + (f"({list(evidence_vars.keys())[:8]})" if evidence_vars else "(none)"),
+        flush=True,
+    )
+    logger.info(
+        "Math sandbox: %d block(s) to execute, %d evidence variable(s) for override injection",
+        total_blocks, len(evidence_vars),
+    )
+
+    do_llm_check = bool(query and groq)
+    do_web_verify = bool(query and groq and _WEB_VERIFY_AVAILABLE)
+    replacements: list[tuple[str, str]] = []
+
+    async def _process(code: str, lang: str) -> str:
+        """
+        Per-block pipeline:
+          1. Sandbox execution (evidence values override LLM-hardcoded ones)
+          2. LLM relevance gate (is this result on-topic?)
+          3. Web verification (is the formula correct? is the result plausible?)
+          4. Format replacement block based on verdict
+        """
+        # ── Step 1: Sandbox execution ──────────────────────────────────────
+        result = await sandbox.execute(code, evidence_vars)
+        if not (result.success and result.stdout):
+            logger.info("Math sandbox (%s): execution failed — %s", lang, result.error)
+            return _ERROR_BLOCK
+
+        # ── Step 2: LLM relevance gate ────────────────────────────────────
+        if do_llm_check:
+            relevant, reason = await _validate_math_relevance(
+                query, code, result.stdout, groq  # type: ignore[arg-type]
+            )
+            if not relevant:
+                logger.info("Math sandbox (%s): LLM flagged as irrelevant — %s", lang, reason)
+                return f"{_IRRELEVANT_BLOCK}\n> *Reason: {reason}*"
+
+        # ── Step 3: Web verification ──────────────────────────────────────
+        if do_web_verify:
+            try:
+                web_result = await web_verify_math(
+                    query=query,
+                    code=code,
+                    result_stdout=result.stdout,
+                    groq=groq,
+                )
+                replacement = format_verified_block(code, result.stdout, web_result)
+                logger.info(
+                    "Math sandbox (%s): web-verified verdict=%s conf=%.2f (%.0f ms total)",
+                    lang, web_result.verdict, web_result.confidence, result.elapsed_ms,
+                )
+                return replacement
+            except Exception as _wv_exc:
+                logger.warning("Web math verify step failed (%s) — falling back to plain result", _wv_exc)
+
+        # ── Fallback: no web verify ────────────────────────────────────────
+        logger.info(
+            "Math sandbox (%s): accepted → %r (%.0f ms)",
+            lang, result.stdout[:80], result.elapsed_ms,
+        )
+        return (
+            f"**[Verified Calculation]**\n"
+            f"```python\n{code}\n```\n"
+            f"> **Result:** `{result.stdout}`"
+        )
+
+    # ── Fenced python/math blocks ──────────────────────────────────────────
+    for m in _FENCED_RE.finditer(text):
+        full_match = m.group(1)
+        lang = m.group(2).lower()
+        code = m.group(3).strip()
+        if not code:
+            continue
+        replacements.append((full_match, await _process(code, lang)))
+
+    # ── <<COMPUTE: ...>> inline tags ──────────────────────────────────────
+    for m in _COMPUTE_TAG_RE.finditer(text):
+        full_match = m.group(1)
+        code = m.group(2).strip()
+        if not code:
+            continue
+        result = await sandbox.execute(code, evidence_vars)
+        if result.success and result.stdout:
+            if do_llm_check:
+                relevant, reason = await _validate_math_relevance(
+                    query, code, result.stdout, groq  # type: ignore[arg-type]
+                )
+                if not relevant:
+                    replacements.append((full_match, f"{_IRRELEVANT_BLOCK}\n> *Reason: {reason}*"))
+                    continue
+            if do_web_verify:
+                try:
+                    web_result = await web_verify_math(
+                        query=query, code=code, result_stdout=result.stdout, groq=groq
+                    )
+                    replacements.append((full_match, format_verified_block(code, result.stdout, web_result)))
+                    continue
+                except Exception:
+                    pass
+            replacements.append((full_match, f"**[Computed]** `{result.stdout}`"))
+        else:
+            replacements.append((full_match, _ERROR_BLOCK))
+
+    # Apply replacements in document order
+    executed = sum(1 for _, r in replacements if "Verified Calculation" in r or "Computed]" in r)
+    failed = len(replacements) - executed
+    print(
+        f"[MATH] Execution complete: {executed} succeeded, {failed} failed out of {len(replacements)} block(s).",
+        flush=True,
+    )
+
+    for original, replacement in replacements:
+        text = text.replace(original, replacement, 1)
+
+    return text

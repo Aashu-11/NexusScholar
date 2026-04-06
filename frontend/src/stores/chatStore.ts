@@ -117,6 +117,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
                             return { messages: msgs, pipelineStatus: null };
                         });
                         break;
+                    case 'math_results':
+                        // Sandbox has executed all code blocks — replace the streamed
+                        // draft text with the verified version immediately.
+                        set(s => {
+                            const msgs = [...s.messages];
+                            const last = msgs[msgs.length - 1];
+                            if (last?.role === 'assistant' && data.updated_text) {
+                                msgs[msgs.length - 1] = { ...last, content: data.updated_text as string };
+                            }
+                            return { messages: msgs, pipelineStatus: 'Math verified ✓' };
+                        });
+                        break;
                     case 'answer_complete':
                         set(s => {
                             const msgs = [...s.messages];
