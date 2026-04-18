@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import { PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen } from 'lucide-react';
+import 'katex/dist/katex.min.css';
 import { useChatStore } from './stores/chatStore';
 import { useEvidenceStore } from './stores/evidenceStore';
 import Sidebar from './components/Sidebar';

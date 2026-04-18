@@ -1572,3 +1572,50 @@ code {
     .messages-container { padding: 0 16px; }
     .query-input-area { padding: 10px 16px 16px; }
 }
+
+/* ── KaTeX / LaTeX math overrides ─────────────────────────────────────────── */
+
+/* Inline math — blend with surrounding text */
+.katex {
+    font-size: 1em;
+    color: var(--ns-text-primary);
+}
+
+/* Display (block) math — centred with breathing room */
+.katex-display {
+    margin: 16px 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 4px 0;
+}
+
+.katex-display > .katex {
+    font-size: 1.1em;
+}
+
+/* Keep KaTeX colours consistent with the dark theme */
+.katex .mord,
+.katex .mbin,
+.katex .mrel,
+.katex .mopen,
+.katex .mclose,
+.katex .minner,
+.katex .mop,
+.katex .mpunct {
+    color: var(--ns-text-primary);
+}
+
+/* Fraction rules and radical bars visible on dark background */
+.katex .frac-line,
+.katex .sqrt > .sqrt-sign {
+    border-color: var(--ns-text-primary);
+}
+
+/* Ordered-list CSS counter */
+.md-ol {
+    counter-reset: md-list;
+}
+.md-ol .md-li-num::before {
+    counter-increment: md-list;
+    content: counter(md-list) '.';
+}
